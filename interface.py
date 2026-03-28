@@ -83,8 +83,8 @@ def parse_csv_data(filepath: str, num_customers: Optional[int] = None) -> Tuple[
         Tuple of (coordinates, customer_demands, vehicle_params, 
                   earliest_times, latest_times, service_times)
     """
-    df = pd.read_csv(filepath)
-    
+    df = pd.read_csv(filepath).dropna(subset=['Coordinates'])
+
     if num_customers is None:
         num_customers = len(df) - 1
     
@@ -153,12 +153,12 @@ def run_solver(coordinates: Dict, customer_demands: Dict, vehicle_params: Dict,
         }
     
     solver = MCVRPTW(
-        Coordinates=coordinates,
-        Customer_demands=customer_demands,
-        Vehicle_parameters=vehicle_params,
-        Earliest_service_time=earliest_times,
-        Latest_service_time=latest_times,
-        Service_time=service_times,
+        coordinates=coordinates,
+        customer_demands=customer_demands,
+        vehicle_parameters=vehicle_params,
+        earliest_service_time=earliest_times,
+        latest_service_time=latest_times,
+        service_time=service_times,
         hyperparameter_impact1=impact_weights['impact1'],
         hyperparameter_impact2=impact_weights['impact2'],
         hyperparameter_impact3=impact_weights['impact3'],
