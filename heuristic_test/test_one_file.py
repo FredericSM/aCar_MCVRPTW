@@ -1,5 +1,6 @@
 import sys
-sys.path.append(r'C:\Users\frede\PycharmProjects\aCar_MCVRPTW\heuristics')
+import pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from heuristics.MCVRPTW import MCVRPTW
 import pandas as pd
 
@@ -13,7 +14,7 @@ with open('../Dataset/benchmarking_dataset/dataset'+name_of_problem+'.csv') as c
 
 Coordinates = {i: eval(Data['Coordinates'][i]) for i in range(number_of_customer+1)}
 Customer_demands = {i: eval(Data['Customer_demands'][i]) for i in range(number_of_customer+1)}
-Vehicle_parameters = {'lenght_capacity': 20000, 'speed': 100,
+Vehicle_parameters = {'length_capacity': 20000, 'speed': 100,
                       'product_capacity': Data['Vehicle_capacity']}
 Earliest_service_time = [eval(Data['Earliest_service_time'][i])[0] for i in range(number_of_customer+1)]
 Earliest_service_time.append(0)

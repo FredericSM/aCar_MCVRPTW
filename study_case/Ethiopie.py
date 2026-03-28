@@ -1,5 +1,6 @@
 import sys
-sys.path.append(r'C:\Users\frede\PycharmProjects\aCar_MCVRPTW\heuristics')
+import pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from heuristics.MCVRPTW_for_studycase import MCVRPTW
 import pandas as pd
 import math
@@ -86,7 +87,7 @@ Cost = {'cost_per_km':0.0412, 'cost_per_vehicle':18000} #euros
 #                                 Customer_demands[i + 1][1] + Duration['ED'] * Customer_demands[i + 1][2] + Duration[
 #                                     'PNC'] * Customer_demands[i + 1][3]]) for i in range(number_of_cluster - 1)}
 #     Service_time[0] = 0
-#     Vehicle_parameters = {'lenght_capacity': 200, 'speed': 1,
+#     Vehicle_parameters = {'length_capacity': 200, 'speed': 1,
 #                           'product_capacity': [n * 609, n * 1105, n * 345, n * 32]}  # WDS,ELEC,ED,PNC 50 kg+100kg
 #
 #     VRP = MCVRPTW(Coordinates=Coordinates,Distance=Distance,Travel_time=Traveling_time, Customer_demands=Customer_demands, Vehicle_parameters=Vehicle_parameters,
@@ -120,7 +121,7 @@ Service_time = {i + 1: max([Duration['WDS'] * Customer_demands[i + 1][0] + Durat
                             Customer_demands[i + 1][1] + Duration['ED'] * Customer_demands[i + 1][2] + Duration[
                                 'PNC'] * Customer_demands[i + 1][3]]) for i in range(number_of_cluster - 1)}
 Service_time[0] = 0
-Vehicle_parameters = {'lenght_capacity': 200, 'speed': 1,
+Vehicle_parameters = {'length_capacity': 200, 'speed': 1,
                       'product_capacity': [n * 609, n * 1105, n * 345, n * 32]}  # WDS,ELEC,ED,PNC 50 kg+100kg
 
 VRP = MCVRPTW(Coordinates=Coordinates,Distance=Distance,Travel_time=Traveling_time, Customer_demands=Customer_demands, Vehicle_parameters=Vehicle_parameters,

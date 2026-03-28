@@ -1,5 +1,6 @@
 ﻿import sys
-sys.path.append(r'C:\Users\frede\PycharmProjects\aCar_MCVRPTW\heuristics')
+import pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from heuristics.MCVRPTW_for_studycase import MCVRPTW
 import pandas as pd
 import math
@@ -70,7 +71,7 @@ Cost = {'cost_per_km':0.0412, 'cost_per_vehicle':14000} #euros
 #     for i in range(len(Customer_demands)):
 #         if Id_to_index[i] not in set:
 #             Customer_demands[i] = [0,0]
-#     Vehicle_parameters = {'lenght_capacity': 200, 'speed': 1,
+#     Vehicle_parameters = {'length_capacity': 200, 'speed': 1,
 #                           'product_capacity': [4864,32]}
 #     Earliest_service_time = [8 for i in range(number_of_cluster+2)]
 #     Latest_service_time = [16 for i in range(number_of_cluster+2)]
@@ -97,7 +98,7 @@ Cost = {'cost_per_km':0.0412, 'cost_per_vehicle':14000} #euros
 Coordinates = {i:(Latitude[i],Longitude[i]) for i in range(number_of_cluster)}
 Customer_demands = {i+1: [Data_demands.iloc[i,1],Data_demands.iloc[i,2]/52] for i in range(number_of_cluster-1)}
 Customer_demands[0] = [0,0]
-Vehicle_parameters = {'lenght_capacity': 200, 'speed': 1,
+Vehicle_parameters = {'length_capacity': 200, 'speed': 1,
                       'product_capacity': [4864,32]}
 Earliest_service_time = [8 for i in range(number_of_cluster+2)]
 Latest_service_time = [16 for i in range(number_of_cluster+2)]

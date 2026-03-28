@@ -1,5 +1,6 @@
 import sys
-sys.path.append(r'C:\Users\frede\PycharmProjects\aCar_MCVRPTW\heuristics')
+import pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from heuristics.MCVRPTW import MCVRPTW
 import time
 import pandas as pd
@@ -22,7 +23,7 @@ for p in [1,10]:
             n = 2 ** m
             Coordinates = {j:eval(df.Coordinates_set.iloc[i])[j] for j in range(n)}
             Customer_demands = {j:eval(df.eval('Customer_demands_p' + str(p) + '_set').iloc[i])[j] for j in range(n)}
-            Vehicle_parameters = {'lenght_capacity': 200, 'speed': 1,
+            Vehicle_parameters = {'length_capacity': 200, 'speed': 1,
                                   'product_capacity': {product: 100 for product in range(p)}}
             Earliest_service_time = eval(df.Earliest_service_time_set.iloc[i])[:n]+[0]
             Latest_service_time = eval(df.Latest_service_time_set.iloc[i])[:n]

@@ -1,770 +1,1205 @@
+"""
+MCVRPTW — Multi-Compartment Vehicle Routing Problem with Time Windows
+
+Implements an ALNS-inspired greedy insertion heuristic.  The construction
+follows a polar-sweep strategy: a *seed* customer (far from the depot in
+polar coordinates) opens each new route, and unrouted customers are
+greedily inserted at the position that minimises a weighted composite
+*Impact* score.
+
+A new vehicle is opened whenever no feasible insertion exists for any
+remaining customer in the current route.
+
+Algorithm outline (Repoussis et al., 2006 — extended for multi-compartment):
+    Step 0  Initialise.  Compute polar coordinates for all customers.
+    Step 1  Select a seed customer to start a new route (farthest, angularly
+            separated from the previous seed).
+    Step 2  For every unrouted customer u compute Impact(u):
+              a. Find all feasible insertion positions in the current route.
+              b. Compute local disturbance LD(u) at each position.
+              c. Choose the position with minimum LD(u).
+              d. Compute global Impact(u) as a weighted sum of four criteria.
+    Step 3  Insert the customer u* with minimum Impact(u*) at its best
+            position.  Update arrival times and remaining capacity.
+    Step 4  If a feasible insertion exists for at least one unrouted customer,
+            go to Step 2.  Otherwise close the route and go to Step 1.
+    Step 5  All customers served — output the solution.
+"""
+
+from __future__ import annotations
+
+import math
+import warnings
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
-import random as rnd
-import math as mt
-import matplotlib.pyplot as plt
-from typing import List, Dict, Optional, TypeVar
 
-Customer = TypeVar('Customer')
-Index = TypeVar('Index')
-#useful for describing the inputs
+from .models import SolverResult, VehicleParameters
+from .visualizer import RouteVisualizer
+
+# ---------------------------------------------------------------------------
+# Module-level constants
+# ---------------------------------------------------------------------------
+
+# Angular half-width of the exclusion window used when selecting the next
+# seed customer.  A value of π/6 (30°) prevents consecutive routes from
+# clustering in the same angular sector.
+_DEFAULT_ANGLE_WINDOW: float = math.pi / 6
+
+# Default weights for the four Impact criteria.  Must sum to 1.
+_DEFAULT_IMPACT_WEIGHTS: Dict[str, float] = {
+    "impact1": 0.1,
+    "impact2": 0.2,
+    "impact3": 0.1,
+    "impact4": 0.6,
+}
+
+# Sentinel value assigned to customers with no feasible insertion position so
+# that they are always ranked last in the Impact table.
+_INFEASIBLE_IMPACT: float = 1e5
+
+# ---------------------------------------------------------------------------
+# Type aliases
+# ---------------------------------------------------------------------------
+
+CustomerID = int   # Index of a customer node; 0 is always the depot.
+RouteIndex = int   # Position index within a route list.
 
 
-class MCVRPTW():
+class MCVRPTW:
+    """Greedy insertion heuristic for the Multi-Compartment VRPTW.
+
+    Args:
+        coordinates: Mapping ``{customer_id: (x, y)}`` for every node.
+            Node 0 is the depot.
+        customer_demands: Mapping ``{customer_id: [qty_p0, qty_p1, ...]}``.
+            Node 0 must be present with all-zero demands.
+        vehicle_parameters: Vehicle configuration.  Use the
+            :class:`~heuristics.models.VehicleParameters` TypedDict::
+
+                {
+                    "length_capacity": 200.0,
+                    "speed": 60.0,
+                    "product_capacity": {0: 100.0, 1: 100.0},
+                }
+
+        earliest_service_time: Lower-bound arrival time for each node.
+            Length must be ``n_customers + 2``: the first entry is the
+            earliest depot departure and the last is a sentinel (use 0).
+        latest_service_time: Upper-bound arrival time for each node.
+            Same length as ``earliest_service_time``.
+        service_time: Mapping ``{customer_id: duration}`` for the time
+            spent servicing each customer (depot = 0).
+        hyperparameter_impact1: Weight for the time-window-coverage
+            criterion (default 0.1).
+        hyperparameter_impact2: Weight for the total-waiting-time
+            criterion (default 0.2).
+        hyperparameter_impact3: Weight for the non-routed-customer-impact
+            criterion (default 0.1).
+        hyperparameter_impact4: Weight for the local-disturbance
+            (metrics summation) criterion (default 0.6).
+        distance_matrix: Optional pre-computed symmetric distance matrix
+            where ``D[i][j]`` is the distance between nodes *i* and *j*.
+            When ``None`` the matrix is derived from Euclidean coordinates.
+
+    Raises:
+        ValueError: If the Impact weights do not sum to 1 (within 1 × 10⁻⁶).
+        ValueError: If ``coordinates`` or ``customer_demands`` are empty.
+
+    Outputs (available after calling :meth:`solve`):
+        routes:
+            Each inner list is a sequence of customer IDs beginning and
+            ending with 0 (depot).  E.g. ``[[0, 3, 1, 0], [0, 4, 2, 0]]``.
+        arrival_times:
+            Arrival time at each customer, indexed by customer ID.
+        arrival_times_by_route:
+            Same data arranged in route order for easy per-route inspection.
+        capacity_per_vehicle:
+            Total product quantities loaded on each vehicle.
+        distance_per_vehicle:
+            Distance travelled by each vehicle.
+        total_distance:
+            Sum of all per-vehicle distances (primary optimisation target).
+
+    Example:
+        >>> solver = MCVRPTW(
+        ...     coordinates=coords,
+        ...     customer_demands=demands,
+        ...     vehicle_parameters={
+        ...         "length_capacity": 200,
+        ...         "speed": 60,
+        ...         "product_capacity": {0: 100, 1: 100},
+        ...     },
+        ...     earliest_service_time=est,
+        ...     latest_service_time=lst,
+        ...     service_time=svc,
+        ... )
+        >>> result = solver.solve()
+        >>> print(result)
+        SolverResult(vehicles=4, total_distance=312.45)
     """
-     -----
-    Input :
-    # exemple : for 10 customers and  5 different products
-    Coordinate : dict --> {0: (-4, -6), 1: (-3, -10), 2: (0, -6), 3: (-6, 5), 4: (1, -2), 5: (-9, 8), 6: (10, -9), 7: (5, 7), 8: (-9, 9), 9: (6, -3), 10: (-7, -5)}
-    Customer_demands : dict --> {0: [0,0,0,0,0], 1: [6, 8, 3, 2, 4], 2: [4, 8, 5, 7, 2], 3: [7, 1, 4, 9, 3], 4: [8, 3, 2, 9, 1], 5: [7, 2, 1, 5, 8], 6: [1, 7, 5, 8, 9], 7: [7, 9, 1, 6, 3], 8: [1, 3, 9, 6, 5], 9: [9, 4, 2, 1, 7], 10: [2, 5, 9, 7, 8]}
-    Vehicle_parameter : dict --> {'lenght_capacity' : 100, 'speed' : 100, 'product_capacity' : {0:50,1:50,2:50,3:50,4:50}}
-    Distance_between_customers : List --> Distance_between_customer[i][j] gives the distance between customer i and j
-                                            [[0.0, 5.0990195135927845, 11.40175425099138, 5.830951894845301, 8.54400374531753, 13.038404810405298, 10.295630140987, 27.294688127912362, 24.515301344262525, 5.0990195135927845, 37.21558813185679], [5.0990195135927845, 0.0, 12.165525060596439, 10.198039027185569, 9.219544457292887, 14.560219778561036, 15.231546211727817, 28.0178514522438, 26.92582403567252, 10.0, 39.05124837953327], [11.40175425099138, 12.165525060596439, 0.0, 16.1245154965971, 3.0, 2.8284271247461903, 13.416407864998739, 16.0312195418814, 15.264337522473747, 14.422205101855956, 26.92582403567252], [5.830951894845301, 10.198039027185569, 16.1245154965971, 0.0, 13.601470508735444, 17.08800749063506, 8.94427190999916, 31.32091952673165, 27.0, 2.0, 40.01249804748511], [8.54400374531753, 9.219544457292887, 3.0, 13.601470508735444, 0.0, 5.385164807134504, 12.36931687685298, 19.026297590440446, 17.88854381999832, 12.041594578792296, 29.832867780352597], [13.038404810405298, 14.560219778561036, 2.8284271247461903, 17.08800749063506, 5.385164807134504, 0.0, 12.806248474865697, 14.317821063276353, 12.529964086141668, 15.231546211727817, 24.515301344262525], [10.295630140987, 15.231546211727817, 13.416407864998739, 8.94427190999916, 12.36931687685298, 12.806248474865697, 0.0, 25.553864678361276, 19.4164878389476, 7.211102550927978, 32.38826948140329], [27.294688127912362, 28.0178514522438, 16.0312195418814, 31.32091952673165, 19.026297590440446, 14.317821063276353, 25.553864678361276, 0.0, 9.486832980505138, 29.410882339705484, 12.806248474865697], [24.515301344262525, 26.92582403567252, 15.264337522473747, 27.0, 17.88854381999832, 12.529964086141668, 19.4164878389476, 9.486832980505138, 0.0, 25.0, 13.038404810405298], [5.0990195135927845, 10.0, 14.422205101855956, 2.0, 12.041594578792296, 15.231546211727817, 7.211102550927978, 29.410882339705484, 25.0, 0.0, 38.01315561749642], [37.21558813185679, 39.05124837953327, 26.92582403567252, 40.01249804748511, 29.832867780352597, 24.515301344262525, 32.38826948140329, 12.806248474865697, 13.038404810405298, 38.01315561749642, 0.0]]
-    Earliest_service_time : dict --> Earliest_serice_time[i] gives the lower bound of the arrival time for the delivery for customer i
-                                    [0, 779, 499, 749, 131, 439, 16, 409, 73, 498, 532, 0]
-                                    the first value indicates when the vehicle can leave at first the depot to deliver the first client
-                                    the last value of Earliest_serice_time is necessery. 0 is a good choice. We could get ride of it but it is usefull to avoid to make case disjunctions according to the fact we are at the end of the route or not
-    Latest_service_time : dict --> Latest_serice_time[i] gives the upper bound of the arrival time for the delivery for customer i
-                                    [1000, 923, 549, 841, 254, 588, 86, 533, 161, 621, 671, 1000]
-                                    the first value is not veru important but I set it up as the maximal value of the set in order to avoid any problems
-                                    the last value of Latest_service_time is useless but it allows to have the same lenght than Earliest_serice_time
-    Service_time : List --> [s1,s2,...,sp] give for each products the time needed for delivering for one unit of product
-                            [10,1,15,35,5]
-    -----
-    Remarks :
-    Arrival_time : list --> Arrival_time[i] refers to the arrival time of vehicle i
-    Feasible_insertion_places : list --> (Ir) set of all feasible insertion places of customer u into route r
-    -----
-    Hyperparameters :
-    hyperparameter_impact1
-    hyperparameter_impact2
-    hyperparameter_impact3
-    hyperparameter_impact4
-    --> hyperparameter_impact1 + hyperparameter_impact2 + hyperparameter_impact3 + hyperparameter_impact4 = 1
-    hyperparameter_metric1
-    hyperparameter_metric2
-    hyperparameter_metric3
-    --> hyperparameter_metric1 + hyperparameter_metric2 + hyperparameter_metric3 = 1
-    -----
-    Impact functions :
-    Impact1_time_window_coverage (ISu)
-    Impact2_total_waiting_time (IWu)
-    Impact3_non_routed_customers (IUu)
-    Impact4_metrics_summation (LDu)
-    Impact4_already_assigned_customers (IRu)
 
-    Metrics functions :
-    metric1_distance_increase (c1u : Clark & Wrighte)
-    metric2_time_delay (c2u : time delay for customer j after inserting a new customer u between customer i and j)
-    metric3_time_gap (c3u : define a time gap between the latest service time lu of the customer u and the time of the vehicle arrival at customer u)
-    ---------------------
-    ---------------------
-    Output:
-    -self.Routes --> give each route one by one (0 is the depot, so the begining and the end of each route is 0)
-    -self.number_of_vehicle
-    -self.Arrival_time --> give the delivery time of each customer in the same order than the inputs
-    -self.Arrival_time_with_same_order_than_Routes --> give the delivery time of each customer in the same order than the routes (very useful also)
-    -self.Capacity_related_to_Routes --> give such a table [[[product1,product2,....],traveled distance by vehicle1]#route1,...] in which each element matchs with the needed capacity for each product (table) to deliver each clustomers of the route and the traveled distance during the route
-    -self.Distance_done [total traveled distance,[traveled distance by vehicle1,traveled distance by vehicle2,...]]--> similar to the previous one, it give the total traveled distance and
-    -----
-    if you just need to run the algorithm without understanding it, just run the function all_run
-    -----
-    """
+    def __init__(
+        self,
+        coordinates: Dict[CustomerID, Tuple[float, float]],
+        customer_demands: Dict[CustomerID, List[float]],
+        vehicle_parameters: VehicleParameters,
+        earliest_service_time: List[float],
+        latest_service_time: List[float],
+        service_time: Dict[CustomerID, float],
+        hyperparameter_impact1: float = _DEFAULT_IMPACT_WEIGHTS["impact1"],
+        hyperparameter_impact2: float = _DEFAULT_IMPACT_WEIGHTS["impact2"],
+        hyperparameter_impact3: float = _DEFAULT_IMPACT_WEIGHTS["impact3"],
+        hyperparameter_impact4: float = _DEFAULT_IMPACT_WEIGHTS["impact4"],
+        distance_matrix: Optional[List[List[float]]] = None,
+        # Legacy alias kept for backward compatibility (typo in older versions)
+        Distance: Optional[List[List[float]]] = None,
+    ) -> None:
+        self._validate_inputs(
+            coordinates, customer_demands, vehicle_parameters,
+            hyperparameter_impact1, hyperparameter_impact2,
+            hyperparameter_impact3, hyperparameter_impact4,
+        )
 
-    def __init__(self,Coordinates,Customer_demands, Vehicle_parameters, Earliest_service_time, Latest_service_time,
-                 Service_time, hyperparameter_impact1 = 0.1, hyperparameter_impact2 = 0.2, hyperparameter_impact3 = 0.1, hyperparameter_impact4 = 0.6, Distance = None):
+        # Handle legacy keyword argument
+        if distance_matrix is None and Distance is not None:
+            warnings.warn(
+                "The 'Distance' parameter is deprecated; use 'distance_matrix'.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            distance_matrix = Distance
 
-        # Input :
-        self.number_of_customer = len(Customer_demands) - 1
-        self.Coordinates = Coordinates
-        if Distance != None:
-            self.Distance_between_customers = Distance
-        else:
-            self.Distance_between_customers = self.Distance()
-        self.number_of_products = len(Customer_demands[1])
-        self.customer_demands = Customer_demands
-        self.Vehicle_parameters = Vehicle_parameters
-        self.Earliest_service_time = Earliest_service_time
-        self.Latest_service_time = Latest_service_time
-        self.Service_time = Service_time
-        # self.Service_time = {i:sum(Service_time[p]*self.customer_demands[i][p] for p in range(len(self.number_of_products))) for i in range(len(self.number_of_customer)+1}
-        # dict --> Service_time[i] gives the needed time for delivering the services and goods at location of customer i (it has to be approximated) {0:0, 1: 10, 2: 10, 3: 10, 4: 10, 5: 10, 6: 10, 7: 10, 8: 10, 9: 10, 10: 10}
+        # Normalise the legacy misspelling so the rest of the class always uses
+        # 'length_capacity' regardless of which spelling the caller used.
+        if "lenght_capacity" in vehicle_parameters and "length_capacity" not in vehicle_parameters:
+            warnings.warn(
+                "Vehicle parameter key 'lenght_capacity' is deprecated; "
+                "use 'length_capacity'.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            vehicle_parameters = dict(vehicle_parameters)
+            vehicle_parameters["length_capacity"] = vehicle_parameters.pop("lenght_capacity")
 
-        # Eu <= Au & Au + Su <= Lu
+        # ---- problem dimensions ----------------------------------------
+        self.number_of_customer: int = len(customer_demands) - 1
+        self.number_of_products: int = len(customer_demands[1])
 
-        # additional Set
-        self.J_non_routed_customers_set = [i for i in range(1, self.number_of_customer + 1) if
-                                           sum(self.customer_demands[i]) > 0]
-        # we do not add a customer to the non routed_customers_set if it does not need to be delivered
-        self.Routes = [] #[[#route1],[#route2],...]
-        self.number_of_vehicle = 0
-        ### ___ output
-        self.Capacity_related_to_Routes = []  # [[[products],distance]#route1,...]
-        ### ___ output : give the required capacity and distance traveled for each vehicle to deliver each customer of the route
-        self.Feasible_insertion_places = []
+        # ---- input data ------------------------------------------------
+        self.Coordinates = coordinates
+        self.customer_demands = customer_demands
+        self.Vehicle_parameters = vehicle_parameters
+        self.Earliest_service_time = earliest_service_time
+        self.Latest_service_time = latest_service_time
+        self.Service_time = service_time
 
-        # additional Variable :
-        self.Arrival_time = [self.Earliest_service_time[0]] + [self.Latest_service_time[-1] for i in range(self.number_of_customer)] + [max(self.Latest_service_time)]
-        self.Arrival_time_with_same_order_than_Routes = []
-        self.number_of_customer_with_needs = len(self.J_non_routed_customers_set)
-        self.Distance_done = [0,[]]
-        ### ___ output : give the distance traveled [global distance done,[distance traveled by vehicle 1,distance traveled by vehicle 2,...]
+        # ---- distance matrix -------------------------------------------
+        self.Distance_between_customers: List[List[float]] = (
+            distance_matrix if distance_matrix is not None
+            else self._compute_euclidean_distance_matrix()
+        )
+
+        # ---- customers that actually require delivery ------------------
+        self.J_non_routed_customers_set: List[CustomerID] = [
+            i for i in range(1, self.number_of_customer + 1)
+            if sum(self.customer_demands[i]) > 0
+        ]
+        self.number_of_customer_with_needs: int = len(self.J_non_routed_customers_set)
+
+        # ---- solution state (populated by heuristic) ------------------
+        self.Routes: List[List[int]] = []
+        self.number_of_vehicle: int = 0
+        self.Capacity_related_to_Routes: List[List] = []
+        self.Feasible_insertion_places: List[RouteIndex] = []
+
+        # Arrival_time[i] = scheduled arrival time at customer i.
+        # Initialised to Latest_service_time as a safe upper bound; updated
+        # incrementally during construction.
+        self.Arrival_time: List[float] = (
+            [self.Earliest_service_time[0]]
+            + [self.Latest_service_time[-1]] * self.number_of_customer
+            + [max(self.Latest_service_time)]
+        )
+        self.Arrival_time_with_same_order_than_Routes: List[List[float]] = []
+        self.Distance_done: List = [0, []]
+        self.Problems: List[str] = []
+
+        # ---- geometry helpers -----------------------------------------
+        self.Barycenter: Tuple[float, float] = self._compute_barycenter()
+        self.Customers_polar_coordinates_set: List = []
+        self.hyperparameter_angle_window: float = _DEFAULT_ANGLE_WINDOW
+        self.current_angle_for_route: float = 0.0
+
+        # ---- hyperparameters ------------------------------------------
+        self.hyperparameter_metric1: float = 1 / 3
+        self.hyperparameter_metric2: float = 1 / 3
+        self.hyperparameter_metric3: float = 1 / 3
+        self.hyperparameter_impact1: float = hyperparameter_impact1
+        self.hyperparameter_impact2: float = hyperparameter_impact2
+        self.hyperparameter_impact3: float = hyperparameter_impact3
+        self.hyperparameter_impact4: float = hyperparameter_impact4
+
+    def __repr__(self) -> str:
+        status = (
+            f"solved, vehicles={self.number_of_vehicle}, "
+            f"distance={self.Distance_done[0]:.2f}"
+            if self.Routes else "unsolved"
+        )
+        return f"MCVRPTW(customers={self.number_of_customer}, {status})"
+
+    # ================================================================
+    # Public API
+    # ================================================================
+
+    def solve(self) -> SolverResult:
+        """Run the full pipeline and return a structured result.
+
+        Executes the heuristic, computes total distance, normalises the depot
+        index in every route, and returns a :class:`~heuristics.models.SolverResult`.
+
+        Returns:
+            A frozen :class:`~heuristics.models.SolverResult` with all
+            solution attributes populated.
+        """
+        self.heuristic()
+        self.compute_done_distance()
+        self.change_last_by_0()
+        return SolverResult(
+            routes=self.Routes,
+            number_of_vehicles=self.number_of_vehicle,
+            arrival_times=self.Arrival_time,
+            arrival_times_by_route=self.Arrival_time_with_same_order_than_Routes,
+            capacity_per_vehicle=[
+                self.Capacity_related_to_Routes[i][0]
+                for i in range(self.number_of_vehicle)
+            ],
+            distance_per_vehicle=self.Distance_done[1],
+            total_distance=self.Distance_done[0],
+        )
+
+    def all_run(self) -> None:
+        """Run the full pipeline and print a human-readable summary.
+
+        .. deprecated::
+            Prefer :meth:`solve` which returns a structured
+            :class:`~heuristics.models.SolverResult` instead of printing.
+        """
+        warnings.warn(
+            "all_run() is deprecated; use solve() for a structured result.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        result = self.solve()
+        print("Number of Vehicles:", result.number_of_vehicles)
+        print("Routes:", result.routes)
+        print(
+            "Delivery time for each customer (route order):",
+            result.arrival_times_by_route,
+        )
+        print("Products capacity needed per vehicle:", result.capacity_per_vehicle)
+        print("Distance traveled per vehicle:", result.distance_per_vehicle)
+        print("Total distance:", result.total_distance)
+
+    def get_visualizer(self) -> RouteVisualizer:
+        """Return a :class:`~heuristics.visualizer.RouteVisualizer` bound to this instance.
+
+        Example:
+            >>> result = solver.solve()
+            >>> solver.get_visualizer().display_solution(result.routes)
+        """
+        return RouteVisualizer(
+            coordinates=self.Coordinates,
+            customer_demands=self.customer_demands,
+            number_of_customers=self.number_of_customer,
+        )
+
+    def check_solution(self) -> List[str]:
+        """Validate the current solution and return a list of constraint violations.
+
+        Checks:
+        - Route distance does not exceed vehicle capacity.
+        - Arrival times are monotonically increasing within each route.
+        - Every customer is served within its time window.
+        - Product capacity is not exceeded on any route.
+        - Every customer that requires delivery appears exactly once.
+
+        Returns:
+            A list of human-readable violation descriptions.  An empty list
+            means the solution is feasible.
+        """
         self.Problems = []
+        self._check_all_is_allright()
+        return self.Problems
 
-        # geometry
-        # self.average_distance_between_two_customers = sum(self.Distance_between_customers)/2/self.number_of_customer**2
-        # self.estimation_number_vehicles_regarding_demand = sum(self.customer_demands)/(0.9*self.Vehicle_parameters['product_capacity'])
-        # self.estimation_number_vehicles_regarding_distance = int(self.Vehicle_parameters['lenght_capacity']/self.average_distance_between_two_customers)
-        self.Barycenter = self.barycenter()
-        self.Customers_polar_coordinates_set = []
-        self.angle_rotation_for_new_route = 0
-        self.hyperparameter_angle_window = np.pi / 6
-        self.current_angle_for_route = 0
+    # ================================================================
+    # Geometry helpers
+    # ================================================================
 
-        # Parameter :
-        self.hyperparameter_metric1 = 1 / 3
-        self.hyperparameter_metric2 = 1 / 3
-        self.hyperparameter_metric3 = 1 / 3
-        self.hyperparameter_impact1 = hyperparameter_impact1
-        self.hyperparameter_impact3 = hyperparameter_impact3
-        self.hyperparameter_impact2 = hyperparameter_impact2  # [0.2 - 0.4]
-        self.hyperparameter_impact4 = hyperparameter_impact4  # [0.3 - 0.6]
+    def _compute_euclidean_distance_matrix(self) -> List[List[float]]:
+        """Build the Euclidean distance matrix D where D[i][j] = dist(i, j).
 
-    # % Plot
-    def display_customers(self)->None:
-        """if needed, this function can be useful for showing only the customers"""
-        annotation_treshold = 1 / 60 * (max([self.Coordinates[i][1] for i in range(self.number_of_customer + 1)]) - min(
-            [self.Coordinates[i][1] for i in range(self.number_of_customer + 1)]))
-        plt.scatter([self.Coordinates[i][0] for i in range(1, self.number_of_customer + 1)],
-                    [self.Coordinates[i][1] for i in range(1, self.number_of_customer + 1)], c='b')
-        # for i in range(1, self.number_of_customer + 1):
-        #     plt.annotate(self.customer_demands[i],
-        #                  (self.Coordinates[i][0] + annotation_treshold, self.Coordinates[i][1]))
-        plt.plot(self.Coordinates[0][0], self.Coordinates[0][1], c='r', marker='s')
-        plt.annotate('Depot', (self.Coordinates[0][0] + annotation_treshold, self.Coordinates[0][1]))
-        # plt.axis('equal')
-        plt.show()
-
-    def display_some_clients(self, Set : list)->None:
-        """show only the customers you want to see """
-        plt.plot(self.loc_x[0], self.loc_y[0], c='r', marker='s')
-        for i in Set:
-            plt.scatter(self.loc_x[i], self.loc_y[i], c='g')
-            plt.annotate('$q_{%d}=%d$' % (i, self.q[str(i)]), (self.loc_x[i] + 2, self.loc_y[i]))
-        plt.axis('equal')
-
-    def display_solution(self)->None:
-        "diplay the solution"
-        plt.figure(dpi=100)
-        annotation_treshold = 1 / 60 * (max([self.Coordinates[i][1] for i in range(self.number_of_customer + 1)]) - min(
-            [self.Coordinates[i][1] for i in range(self.number_of_customer + 1)]))
-        N = [i for i in range(1, self.number_of_customer + 1)]
-        plt.scatter([self.Coordinates[i][0] for i in range(1, self.number_of_customer + 1)],
-                    [self.Coordinates[i][1] for i in range(1, self.number_of_customer + 1)], c='b')
-        active_arcs = []
-        color = ['b', 'g', 'r', 'c', 'm', 'y', 'k', 'b', 'g', 'r', 'c', 'm', 'y', 'k', 'b', 'g', 'r', 'c', 'm', 'y',
-                 'k', 'b', 'g', 'r', 'c', 'm', 'y', 'k']
-        color_index = 0
-        for route in self.Routes:
-            active_arcs.append([color[color_index]])
-            for index_route in range(0, len(route) - 1):
-                active_arcs[color_index].append((route[index_route], route[index_route + 1]))
-            color_index += 1
-        # for i in N:
-        #     plt.annotate(self.customer_demands[i],
-        #                  (self.Coordinates[i][0] + annotation_treshold, self.Coordinates[i][1]))
-        for arc in active_arcs:
-            for i, j in arc[1:]:
-                plt.plot([self.Coordinates[i % (self.number_of_customer + 1)][0],
-                          self.Coordinates[j % (self.number_of_customer + 1)][0]],
-                         [self.Coordinates[i % (self.number_of_customer + 1)][1],
-                          self.Coordinates[j % (self.number_of_customer + 1)][1]], c=arc[0], alpha=0.3)
-        plt.plot(self.Coordinates[0][0], self.Coordinates[0][1], c='r', marker='s')
-        plt.annotate('Depot', (self.Coordinates[0][0] + annotation_treshold, self.Coordinates[0][1]))
-        plt.axis('equal')
-        plt.show()
-
-    def display_current_solution(self,route)->None:
-        "diplay the current solution to help understanding the construction"
-        plt.close('all')
-        Route = self.Routes + [route]
-        plt.figure(dpi=100)
-        annotation_treshold = 1 / 60 * (max([self.Coordinates[i][1] for i in range(self.number_of_customer + 1)]) - min(
-            [self.Coordinates[i][1] for i in range(self.number_of_customer + 1)]))
-        N = [i for i in range(1, self.number_of_customer + 1)]
-        plt.scatter([self.Coordinates[i][0] for i in range(1, self.number_of_customer + 1)],
-                    [self.Coordinates[i][1] for i in range(1, self.number_of_customer + 1)], c='b')
-        active_arcs = []
-        color = ['b', 'g', 'r', 'c', 'm', 'y', 'k', 'b', 'g', 'r', 'c', 'm', 'y', 'k', 'b', 'g', 'r', 'c', 'm', 'y',
-                 'k', 'b', 'g', 'r', 'c', 'm', 'y', 'k']
-        color_index = 0
-        for route in Route:
-            active_arcs.append([color[color_index]])
-            for index_route in range(0, len(route) - 1):
-                active_arcs[color_index].append((route[index_route], route[index_route + 1]))
-            color_index += 1
-        for i in N:
-            plt.annotate(self.customer_demands[i],
-                         (self.Coordinates[i][0] + annotation_treshold, self.Coordinates[i][1]))
-        for arc in active_arcs:
-            for i, j in arc[1:]:
-                plt.plot([self.Coordinates[i % (self.number_of_customer + 1)][0],
-                          self.Coordinates[j % (self.number_of_customer + 1)][0]],
-                         [self.Coordinates[i % (self.number_of_customer + 1)][1],
-                          self.Coordinates[j % (self.number_of_customer + 1)][1]], c=arc[0], alpha=0.3)
-        plt.plot(self.Coordinates[0][0], self.Coordinates[0][1], c='r', marker='s')
-        plt.annotate('Depot', (self.Coordinates[0][0] + annotation_treshold, self.Coordinates[0][1]))
-        plt.axis('equal')
-        plt.show()
-
-    def display_one_route(self,route)->None:
-        "diplay one chosen route to help understanding the construction"
-        plt.figure(dpi=100)
-        annotation_treshold = 1 / 60 * (max([self.Coordinates[i][1] for i in range(self.number_of_customer + 1)]) - min(
-            [self.Coordinates[i][1] for i in range(self.number_of_customer + 1)]))
-        N = [i for i in range(1, self.number_of_customer + 1)]
-        plt.scatter([self.Coordinates[i][0] for i in range(1, self.number_of_customer + 1)],
-                    [self.Coordinates[i][1] for i in range(1, self.number_of_customer + 1)], c='b')
-        active_arcs = []
-        color = ['b', 'g', 'r', 'c', 'm', 'y', 'k', 'b', 'g', 'r', 'c', 'm', 'y', 'k', 'b', 'g', 'r', 'c', 'm', 'y',
-                 'k', 'b', 'g', 'r', 'c', 'm', 'y', 'k']
-        color_index = 0
-
-        active_arcs.append([color[color_index]])
-        for index_route in range(0, len(route) - 1):
-            active_arcs[color_index].append((route[index_route], route[index_route + 1]))
-        color_index += 1
-        for i in N:
-            plt.annotate(self.customer_demands[i],
-                         (self.Coordinates[i][0] + annotation_treshold, self.Coordinates[i][1]))
-        for arc in active_arcs:
-            for i, j in arc[1:]:
-                plt.plot([self.Coordinates[i % (self.number_of_customer + 1)][0],
-                          self.Coordinates[j % (self.number_of_customer + 1)][0]],
-                         [self.Coordinates[i % (self.number_of_customer + 1)][1],
-                          self.Coordinates[j % (self.number_of_customer + 1)][1]], c=arc[0], alpha=0.3)
-        plt.plot(self.Coordinates[0][0], self.Coordinates[0][1], c='r', marker='s')
-        plt.annotate('Depot', (self.Coordinates[0][0] + annotation_treshold, self.Coordinates[0][1]))
-        plt.axis('equal')
-        plt.show()
-
-    # % geometry
-    def change_to_polar_coordinate_with_given_center(self, center: tuple, point: tuple) -> tuple:
+        Returns:
+            Symmetric matrix of size ``(n+1) × (n+1)``.
         """
-        Inputs :
-        center : tuple of coordinates of the point which will be the center for the polar coordinates of the other point
-        point : tuple of coordinates of the point which we want to know the polar coordinates according to the center
-        -----
-        return the radius and the angle
-        """
-        x_relativ = point[0] - center[0]
-        y_relativ = point[1] - center[1]
-        radius = np.hypot(x_relativ, y_relativ)
-        theta = self.theta(x_relativ, y_relativ)
-        return (radius, theta)
+        n = self.number_of_customer + 1
+        return [
+            [
+                float(np.hypot(
+                    self.Coordinates[i][0] - self.Coordinates[j][0],
+                    self.Coordinates[i][1] - self.Coordinates[j][1],
+                ))
+                for j in range(n)
+            ]
+            for i in range(n)
+        ]
 
-    def furthest_from_the_depot(self) -> None:
-        """
-        compute the customers_polar_coordinates_set for all customer with the depot as center
-        self.Customers_polar_coordinates_set give the following table : [[polar coordinates,index of customer],...]
-        """
-        self.Customers_polar_coordinates_set = []
-        Customers_polar_coordinates_set = []
-        for u in range(1, self.number_of_customer + 1):
-            Customers_polar_coordinates_set.append(
-                [self.change_to_polar_coordinate_with_given_center(self.Coordinates[0], self.Coordinates[u]), u])
-        self.Customers_polar_coordinates_set = Customers_polar_coordinates_set
-        # [[polar coordinates,index of customer],...]
+    # Legacy public alias
+    def Distance(self) -> List[List[float]]:
+        """Alias for :meth:`_compute_euclidean_distance_matrix` (legacy)."""
+        return self._compute_euclidean_distance_matrix()
 
-    def theta(self, x:float, y:float)->float:
-        """compute the angle component of the polar coordinates
-        (x,y) is the cartesian coordinate
+    def _compute_barycenter(self) -> Tuple[float, float]:
+        """Compute the demand-weighted centroid of all customer locations.
+
+        Returns:
+            ``(mean_x, mean_y)`` weighted by total demand at each customer.
         """
-        if x == 0 and y != 0:
-            return y / abs(y) * np.pi / 2
-        elif x != 0 and y != 0:
-            if x > 0:
-                return np.arctan(y / x)
-            else:
-                return np.arctan(-y / x) + y / abs(y) * np.pi / 2
-        elif y == 0:
-            if x >= 0:
-                return 0
-            else:
-                return np.pi
+        total_demand = sum(
+            sum(self.customer_demands[i])
+            for i in range(1, self.number_of_customer + 1)
+        )
+        mean_x = sum(
+            sum(self.customer_demands[i]) * self.Coordinates[i][0]
+            for i in range(1, self.number_of_customer + 1)
+        ) / total_demand
+        mean_y = sum(
+            sum(self.customer_demands[i]) * self.Coordinates[i][1]
+            for i in range(1, self.number_of_customer + 1)
+        ) / total_demand
+        return (mean_x, mean_y)
 
-    def barycenter(self) -> tuple:
-        """return the barycenter of all customers weighted by their demands"""
-        mean_x = 0
-        mean_y = 0
-        sum_customers_demands = 0
-        for i in range(1, len(self.customer_demands)):
-            sum_customers_demands += sum(self.customer_demands[i])
-        for i in range(1, self.number_of_customer + 1):
-            mean_x += sum(self.customer_demands[i]) * self.Coordinates[i][0]
-            mean_y += sum(self.customer_demands[i]) * self.Coordinates[i][1]
-        return (mean_x / sum_customers_demands, mean_y / sum_customers_demands)
+    # Legacy public alias
+    def barycenter(self) -> Tuple[float, float]:
+        """Alias for :meth:`_compute_barycenter` (legacy)."""
+        return self._compute_barycenter()
 
-    def depot_as_barycenter(self)->None:
-        """change the coordinate of the depot to those of the barycenter"""
+    def depot_as_barycenter(self) -> None:
+        """Override the depot coordinate with the demand-weighted centroid.
+
+        This can improve solution quality when the depot is far from the
+        customer cluster.
+        """
         self.Coordinates[0] = self.Barycenter
 
-    def Distance(self) -> List[List[float]]:
-        """return the distance between two customers (includes the depot) : D[i][j] is the distance between customers i and j"""
-        Distance = []
-        for i in range(self.number_of_customer + 1):
-            distance = []
-            for j in range(self.number_of_customer + 1):
-                distance.append(np.hypot(self.Coordinates[i][0] - self.Coordinates[j][0],
-                                         self.Coordinates[i][1] - self.Coordinates[j][1]))
-            Distance.append(distance)
-        return Distance
+    @staticmethod
+    def _polar_angle(x: float, y: float) -> float:
+        """Convert Cartesian offsets to a polar angle in ``(-π, π]``.
 
-    def next_seed_customer(self)->list:
+        Args:
+            x: Horizontal offset from the reference centre.
+            y: Vertical offset from the reference centre.
+
+        Returns:
+            Angle in radians in the range ``(-π, π]``.
         """
-        compute the next customer which has to be picked according to the current "seed" customer
-        the next customer to be chosed is the one which has the biggest radius and which angle is not closer
-        than self.hyperparameter_angle_window to the current "seed" customer
-        return the furthest one with the following format : [polar coordinates,index of customer]
+        if x == 0 and y == 0:
+            return 0.0
+        if x == 0:
+            return math.copysign(math.pi / 2, y)
+        if y == 0:
+            return 0.0 if x > 0 else math.pi
+        angle = math.atan(abs(y) / abs(x))
+        if x > 0:
+            return math.copysign(angle, y)
+        # x < 0
+        return math.copysign(math.pi - angle, y)
+
+    def _to_polar(
+        self,
+        center: Tuple[float, float],
+        point: Tuple[float, float],
+    ) -> Tuple[float, float]:
+        """Return the polar coordinates of *point* relative to *center*.
+
+        Args:
+            center: Reference origin ``(x, y)``.
+            point: Target point ``(x, y)``.
+
+        Returns:
+            ``(radius, angle)`` where angle is in ``(-π, π]``.
         """
-        Next_customers = []
-        for customer in self.Customers_polar_coordinates_set:
-            #for all customers, we check if it is too close to the "seed" customer
-            if self.current_angle_for_route + self.hyperparameter_angle_window > np.pi:
-                if customer[0][1] >= (self.current_angle_for_route + self.hyperparameter_angle_window - 2 * np.pi) or \
-                        customer[0][1] <= (self.current_angle_for_route - self.hyperparameter_angle_window):
-                    Next_customers.append(customer)
-            elif self.current_angle_for_route - self.hyperparameter_angle_window <= -np.pi:
-                if customer[0][1] >= (self.current_angle_for_route + self.hyperparameter_angle_window) or customer[0][
-                    1] <= (self.current_angle_for_route - self.hyperparameter_angle_window + 2 * np.pi):
-                    Next_customers.append(customer)
+        dx = point[0] - center[0]
+        dy = point[1] - center[1]
+        return float(np.hypot(dx, dy)), self._polar_angle(dx, dy)
+
+    def furthest_from_the_depot(self) -> None:
+        """Populate ``Customers_polar_coordinates_set`` using the depot as origin.
+
+        Each element has the form ``[(radius, angle), customer_id]``.
+        Sorting or taking the maximum of this list ranks customers by radius
+        (distance from depot), which is used to choose seed customers.
+        """
+        self.Customers_polar_coordinates_set = [
+            [self._to_polar(self.Coordinates[0], self.Coordinates[u]), u]
+            for u in range(1, self.number_of_customer + 1)
+        ]
+
+    def next_seed_customer(self) -> List:
+        """Select the next seed customer for a new route.
+
+        The seed must lie outside an angular window of ±``hyperparameter_angle_window``
+        around the previous seed's angle.  Among the eligible candidates the
+        one with the greatest radius (farthest from depot) is chosen, since
+        distant customers are the hardest to include later.
+
+        Returns:
+            Element from ``Customers_polar_coordinates_set`` in the form
+            ``[(radius, angle), customer_id]``.
+        """
+        half_window = self.hyperparameter_angle_window
+        current_angle = self.current_angle_for_route
+
+        eligible = []
+        for candidate in self.Customers_polar_coordinates_set:
+            candidate_angle = candidate[0][1]
+            # Wrap-around cases near ±π
+            if current_angle + half_window > math.pi:
+                outside_window = (
+                    candidate_angle >= current_angle + half_window - 2 * math.pi
+                    or candidate_angle <= current_angle - half_window
+                )
+            elif current_angle - half_window <= -math.pi:
+                outside_window = (
+                    candidate_angle >= current_angle + half_window
+                    or candidate_angle <= current_angle - half_window + 2 * math.pi
+                )
             else:
-                if customer[0][1] >= (self.current_angle_for_route + self.hyperparameter_angle_window) or customer[0][
-                    1] <= (self.current_angle_for_route - self.hyperparameter_angle_window):
-                    Next_customers.append(customer)
-        if Next_customers == []:
-            #then the angle constraints does not make sens anymore
-            return max(self.Customers_polar_coordinates_set)
-        return max(Next_customers)
-        #[polar coordinates,index of customer]
+                outside_window = (
+                    candidate_angle >= current_angle + half_window
+                    or candidate_angle <= current_angle - half_window
+                )
+            if outside_window:
+                eligible.append(candidate)
 
-    def get_arrival_time_from_previous_customer(self,previous_customer : Customer, current_customer : Customer)->float:
+        # Fall back to global farthest if the angular constraint eliminates everyone
+        pool = eligible if eligible else self.Customers_polar_coordinates_set
+        return max(pool)
+
+    # ================================================================
+    # Arrival-time helpers
+    # ================================================================
+
+    def _arrival_time_after(
+        self, from_customer: CustomerID, to_customer: CustomerID
+    ) -> float:
+        """Compute the earliest feasible arrival time at *to_customer* when
+        departing from *from_customer*.
+
+        Respects the earliest service time (``E[to]``) and accounts for the
+        service duration at *from_customer*.
+
+        Args:
+            from_customer: Node just serviced.
+            to_customer: Node to visit next.
+
+        Returns:
+            ``max(E[to], A[from] + S[from] + D[from][to] / speed)``
         """
-        simplify the text in making it shorter. It computes the arrival time of a selected customer according to the last one
-        :param previous_customer: the index of the customer which is the last one before the current customer
-        :param current_customer: the index of the customer we need the arrival time
-        :return: Acurrent_customer
+        travel = (
+            self.Distance_between_customers[from_customer][
+                to_customer % (self.number_of_customer + 1)
+            ]
+            / self.Vehicle_parameters["speed"]
+        )
+        return max(
+            self.Earliest_service_time[to_customer],
+            self.Arrival_time[from_customer] + self.Service_time[from_customer] + travel,
+        )
+
+    # Legacy public alias
+    def get_arrival_time_from_previous_customer(
+        self, previous_customer: CustomerID, current_customer: CustomerID
+    ) -> float:
+        """Alias for :meth:`_arrival_time_after` (legacy)."""
+        return self._arrival_time_after(previous_customer, current_customer)
+
+    def update_arrival_time(self, after_index: RouteIndex, route: List[int]) -> None:
+        """Propagate shifted arrival times forward from position *after_index*.
+
+        Called after inserting a new customer to keep ``Arrival_time``
+        consistent for every subsequent stop on the route.
+
+        Args:
+            after_index: The index in *route* at which the new customer was
+                inserted.  All nodes from ``route[after_index + 1]`` onward
+                are recalculated.
+            route: The route being modified (in-place).
         """
-        return max(self.Earliest_service_time[current_customer],
-                                 self.Arrival_time[previous_customer] + self.Service_time[previous_customer] +
-                                 self.Distance_between_customers[previous_customer][current_customer % (self.number_of_customer + 1)]
-                / self.Vehicle_parameters['speed'])
+        for idx in range(after_index, len(route) - 2):
+            self.Arrival_time[route[idx + 1]] = max(
+                self.Earliest_service_time[route[idx + 1]],
+                self.Arrival_time[route[idx]]
+                + self.Service_time[route[idx]]
+                + self.Distance_between_customers[route[idx]][route[idx + 1]]
+                / self.Vehicle_parameters["speed"],
+            )
 
-    def update_Feasible_insertion_places(self, u: Customer, route: list) -> None:
+    def update_Arrival_time_with_same_order_than_Routes(self) -> None:
+        """Rebuild ``Arrival_time_with_same_order_than_Routes`` from current state.
+
+        The last entry of each route (the return to depot) is computed
+        explicitly rather than looked up because the depot arrival time is
+        not stored in ``Arrival_time``.
         """
-        update self.Feasible_insertion_places for a specific route with the feasible insertion location index of u in the route.
-        index = i => customer u is insert after customer route[i]
-        -----
-        condition for feasible insertion :
-        -Ai + Si + Dui/v + Su < Lu
-        -capacity condition
-        -distance condition
-        -max(Eu,Ai + Si + Diu/v) + Du(i+1)/v + Su < A(i+1)
-        -Anc + Su + (Dui + Du(i+1) - Di(i+1))/v < Lnc
-        -----
-        Eu <= Au & Au + Su <= Lu
-        """
-        self.Feasible_insertion_places = []
-        self.arrival_time_has_to_be_update = []
-        for index in range(len(route) - 1):
-            Arrival_time_u = self.get_arrival_time_from_previous_customer(previous_customer=route[index],current_customer=u)
-            # Au = max(Eu,Ai + Si + Diu/v)
-            if Arrival_time_u <= self.Latest_service_time[u]:
-            # Au <= Lu => there is time for delivering customer u after customer i (here we work with index so customer i is route[index])
-                if self.check_products_constraints(u, route):
-                # the capacity has to be check next
-                    if self.Capacity_related_to_Routes[-1][1] + self.Distance_between_customers[route[index]][u] + \
-                            self.Distance_between_customers[route[index + 1] % (self.number_of_customer + 1)][u] - \
-                            self.Distance_between_customers[route[index]][
-                                route[index + 1] % (self.number_of_customer + 1)] <= self.Vehicle_parameters[
-                        'lenght_capacity']:
-                    # the distance constraint has to be check also
-                    # total distance traveled by the vehicle + Diu + Du(i+1) - Di(i+1) <= max capacity
-                        # test if it will disturb the next customer already assigned to the route
-                        i1 = route[index]
-                        i2 = route[index + 1]
-                        ti1 = self.Arrival_time[i1]
-                        tu = max(self.Earliest_service_time[u],ti1 + self.Service_time[i1] +
-                                  self.Distance_between_customers[u][i1]
-                                  / self.Vehicle_parameters['speed'])
-                        ti2_u = max(self.Earliest_service_time[i2],tu + self.Service_time[u] +
-                                  self.Distance_between_customers[u][
-                                      i2 % (self.number_of_customer + 1)]
-                                  / self.Vehicle_parameters['speed'])
-                        ti2 = max(self.Earliest_service_time[i2],ti1 + self.Service_time[i1] +
-                                  self.Distance_between_customers[i1][
-                                      i2 % (self.number_of_customer + 1)]
-                                  / self.Vehicle_parameters['speed'])
-                        delta = ti2_u - ti1 - ti2 + ti1
-                        # delta = i->u + u->i+1 - i->i+1
-                        # max between E and A is very important !!!!
-                        # ti2 = max(Ei+1,ti1 + Si + Dii+1/v)
-                        # tu = max(Eu, ti1 + Si + Diu/v)
-                        # ti2_u = max(Eu, ti1 + Si + Diu/v)
-                        sumation = 0
-                        for next_customer in range(index + 1, len(route) - 1):
-                            # we have to check next if all following customers, route[-1] is the depot again
-                            if delta <= self.Latest_service_time[route[next_customer]] - self.Arrival_time[
-                                route[next_customer]]:
-                                # delta < Lnc - Anc  (nc= next customer)
-                                # we have to check if for all next customer, the additional time is smaller than Lnc - Anc
-                                sumation += 1
-                        if sumation == len(route) - index - 2:
-                            # the condition has to be checked for all next customer, ie len(route) - 2 - (index + 1 - 1)
-                            # at the end of the route, len(route) - index - 2 = 0, so all customers can be accepted
-                            self.Feasible_insertion_places.append(index)
-
-
-
-
-    # % Metric functions
-    def metric1_distance_increase(self, u: Customer, i: Customer, j: Customer) -> float:
-        """return the distance increase by adding customer u between customer i and customer j"""
-        return self.Distance_between_customers[i][u] + self.Distance_between_customers[u][j] - \
-            self.Distance_between_customers[i][j]
-
-    def metric2_time_delay(self, u: Customer, i: Customer, j: Customer) -> float:
-        """return the time increase regarding customer j by adding customer u between customers i and j. This time delay, expresses the marginal time feasibility of customer u"""
-        # return (Au + Su + Duj/v) - (Ai + Si + Dij/v)
-        return self.get_arrival_time_from_previous_customer(i,u) + self.Service_time[u] + (self.Distance_between_customers[u][j] -
-                                       self.Distance_between_customers[i][j]) / self.Vehicle_parameters['speed'] - \
-            self.Arrival_time[i] - self.Service_time[i]
-
-    def metric3_time_gap(self, u: Customer, i: Customer, j: Customer) -> float:
-        """Return the time margin (by adding customer u between customers i and j) between the arrival of the vehicle at customer j and its upper bound of service time (it can be negative, which means it is too late). This measure expresses the compatibility of the time window of the selected customer with respect to a particular insertion position of the current route."""
-        # return Lu - (Ai + Si + Diu/v)
-        return self.Latest_service_time[u] - (self.Arrival_time[i] +
-            self.Service_time[i] + self.Distance_between_customers[i][u] / self.Vehicle_parameters['speed'])
-
-    # % Impact functions
-    def Impact1_time_window_coverage(self, u: Customer, i: Customer) -> float:
-        """provides a measure of the coverage of the selected customer’s time window, which results from the insertion of u into the partial constructed route. The goal is to minimize this difference in order to come as close as possible at the lower bound service time.
-        customer u is inserted just after customer i"""
-        return self.Arrival_time[i] + self.Service_time[i] + self.Distance_between_customers[u][i] / \
-            self.Vehicle_parameters['speed'] - self.Earliest_service_time[u]
-
-    def Impact2_total_waiting_time(self, u: Customer, route: list) -> float:
-        """represents the waiting time if the arrival time for each customer is below the lower bound of service time after having inserted customer u ."""
-        sum = 0
-        for i in route:
-            if self.Earliest_service_time[i] - self.Arrival_time[i] > 0:
-                sum += self.Earliest_service_time[i] - self.Arrival_time[i]
-                # sum (Ei-Ai)+
-        return sum
-
-    def Impact3_non_routed_customers(self, u: Customer) -> float:
-        """return the impact of inserting non-routed customer u on the other non-routed customer, goal : minimizing the sum of the difference between the lower bound of service time + distance of customer u to j and the upper bound of service time of customer j"""
-        sum = 0
-        if len(self.J_non_routed_customers_set) == 1:
-            return 0
-        for j in self.J_non_routed_customers_set:
-            if j != u:
-                sum += max(
-                    self.Latest_service_time[j] - self.Earliest_service_time[u] - self.Distance_between_customers[u][
-                        j] / self.Vehicle_parameters['speed'],
-                    self.Latest_service_time[u] - self.Earliest_service_time[j] - self.Distance_between_customers[u][
-                        j] / self.Vehicle_parameters['speed'])
-                # sum j!= u (max(Lj - Eu -Duj/v), Lu - Ej - Duj/v))
-        return sum / (len(self.J_non_routed_customers_set) - 1)
-
-    def Impact4_metrics_summation(self, u: Customer, i: Customer, j: Customer) -> float:
-        """return the summation of all metric functions with weights (local disturbances)"""
-        return self.hyperparameter_metric1 * self.metric1_distance_increase(u, i,
-                                                                            j) + self.hyperparameter_metric2 * self.metric2_time_delay(
-            u, i, j) + self.hyperparameter_metric3 * self.metric3_time_gap(u, i, j)
-
-    def Impact4_already_assigned_customers(self, u: int) -> float:
-        """return the summation of all local disturbances divided by the number of feasible insertion places"""
-        sum = 0
-        for i in self.Feasible_insertion_places:
-            sum += self.Impact4_metrics_summation(u, i, i + 1)
-        return sum / len(self.Feasible_insertion_places)
-
-    def Impact(self, u: int) -> float:
-        """return the global impact of inserting customer u. goal : minimize the output """
-        return self.hyperparameter_impact1 * self.Impact1_time_window_coverage(
-            u) + self.hyperparameter_impact3 * self.Impact3_non_routed_customers(
-            u) + self.hyperparameter_impact2 * self.Impact2_total_waiting_time(
-            u) + self.hyperparameter_impact4 * self.Impact4_already_assigned_customers(u)
-
-    # % other
-
-    def get_number_of_customer_in_Routes(self) -> int:
-        """return the number of customer in Routes (set of all routes)"""
-        counter = 0
-        for R in self.Routes:
-            for r in R[1:-1]:
-                counter += 1
-        return counter
-
-    def compute_done_distance(self)->None:
-        """compute the distance which has been done by all vehicles and pro vehicles
-        [total distance,[distance vehicle 1,distance vehicle 1,....]]
-        """
-        done_distance = 0
+        self.Arrival_time_with_same_order_than_Routes = []
         for route in self.Routes:
-            self.Distance_done[1].append(sum(
-                self.Distance_between_customers[route[i]][route[(i + 1)] % (self.number_of_customer + 1)] for i in
-                range(len(route) - 1)))
-        self.Distance_done[0] = sum([i for i in self.Distance_done[1]])
+            times = [self.Arrival_time[node] for node in route]
+            last_customer = route[-2]
+            times[-1] = (
+                times[-2]
+                + self.Service_time[last_customer]
+                + self.Distance_between_customers[last_customer][route[0]]
+                / self.Vehicle_parameters["speed"]
+            )
+            self.Arrival_time_with_same_order_than_Routes.append(times)
 
-    def update_Capacity_related_to_Routes(self, i: Index, u: Customer, route: list)->None:
-        """update the capacity needed to deliver the current customers part of the current route"""
-        for product in range(self.number_of_products):
-            self.Capacity_related_to_Routes[-1][0][product] += self.customer_demands[u][product]
-        self.Capacity_related_to_Routes[-1][1] += self.Distance_between_customers[route[i]][u] + \
-                                                  self.Distance_between_customers[
-                                                      route[i + 1] % (self.number_of_customer + 1)][u] - \
-                                                  self.Distance_between_customers[route[i]][
-                                                      route[i + 1] % (self.number_of_customer + 1)]
+    # ================================================================
+    # Capacity helpers
+    # ================================================================
 
-    def check_products_constraints(self, u: Customer, route: list) -> None:
-        """check if the constraint about the products is respected"""
+    def _check_product_capacity(
+        self, customer: CustomerID, route: List[int]
+    ) -> bool:
+        """Return ``True`` if inserting *customer* keeps all product loads feasible.
+
+        Args:
+            customer: Candidate customer to insert.
+            route: Current route (used implicitly via
+                ``Capacity_related_to_Routes[-1]``).
+
+        Returns:
+            ``True`` when the capacity constraint is satisfied for every
+            product type.
+        """
         for product in range(self.number_of_products):
-            if self.Capacity_related_to_Routes[-1][0][product] + self.customer_demands[u][product] > \
-                    self.Vehicle_parameters['product_capacity'][product]:
+            current_load = self.Capacity_related_to_Routes[-1][0][product]
+            added_demand = self.customer_demands[customer][product]
+            capacity = self.Vehicle_parameters["product_capacity"][product]
+            if current_load + added_demand > capacity:
                 return False
         return True
 
-    def update_Arrival_time_with_same_order_than_Routes(self):
-        """based on the customer order of the route, it show instead the arrival time. It is usefull to check if the is no time window constraint violation"""
-        self.Arrival_time_with_same_order_than_Routes = []
-        for i in range(len(self.Routes)):
-            self.Arrival_time_with_same_order_than_Routes.append([self.Arrival_time[i] for i in self.Routes[i]])
-            self.Arrival_time_with_same_order_than_Routes[-1][-1] = self.Arrival_time_with_same_order_than_Routes[-1][-2] + \
-                    self.Service_time[self.Routes[i][-2]] + \
-                    self.Distance_between_customers[self.Routes[i][-2]][self.Routes[i][0]] / self.Vehicle_parameters['speed']
+    # Legacy public alias
+    def check_products_constraints(
+        self, customer: CustomerID, route: List[int]
+    ) -> bool:
+        """Alias for :meth:`_check_product_capacity` (legacy)."""
+        return self._check_product_capacity(customer, route)
 
-    def update_arrival_time(self, i_best: Index, route: list) -> None:
-        """shift the arrival time of all customer after customer u_best"""
-        for index in range(i_best, len(route) - 2):
-            self.Arrival_time[route[index + 1]] = max(
-                self.Arrival_time[route[index]] + self.Service_time[route[index]] +
-                self.Distance_between_customers[route[index]][route[index + 1]] / self.Vehicle_parameters['speed'],
-                self.Earliest_service_time[route[index + 1]])
-            # Au = max(Ai + Si + Dui/v,Eu) (i = route[i_best])
+    def update_Capacity_related_to_Routes(
+        self, insertion_index: RouteIndex, customer: CustomerID, route: List[int]
+    ) -> None:
+        """Update product loads and distance for the current vehicle after insertion.
 
-    def check_all_is_allright(self) -> None:
-        """function to check if everything is right"""
-        number_of_customers = 0
-        for route in self.Routes:
-            capacity = [0 for i in range(self.number_of_products)]
-            number_of_customers += len(route) - 2
-            if sum([self.Distance_between_customers[route[i]][route[i + 1] % (self.number_of_customer + 1)] for i in
-                    range(len(route) - 1)]) > self.Vehicle_parameters['lenght_capacity']:
-                self.Problems.append('the lenght capacity is overwhelmed')
-                print('the lenght capacity is overwhelmed')
-            if max([self.Arrival_time[route[i]] - self.Arrival_time[route[i + 1]] for i in range(len(route) - 2)]) > 0:
-                print('error timing between customers')
-                self.Problems.append('error timing between customers')
-            for customer in route[1:-1]:
-                if self.Arrival_time[customer] < self.Earliest_service_time[customer] or self.Arrival_time[customer] > \
-                        self.Latest_service_time[customer]:
-                    print('error timing',customer)
-                    self.Problems.append(['error timing',customer,route])
-                    print(self.Earliest_service_time[customer], self.Arrival_time[customer],
-                          self.Latest_service_time[customer],route,self.Routes.index(route))
-                for product in range(self.number_of_products):
-                    capacity[product] += self.customer_demands[customer][product]
+        Args:
+            insertion_index: Position in *route* after which *customer* is
+                inserted (i.e. between ``route[insertion_index]`` and
+                ``route[insertion_index + 1]``).
+            customer: Customer being inserted.
+            route: Current route list.
+        """
+        depot_modulo = self.number_of_customer + 1
+        prev_node = route[insertion_index]
+        next_node = route[insertion_index + 1] % depot_modulo
+
         for product in range(self.number_of_products):
-            if capacity[product] > self.Vehicle_parameters['product_capacity'][product]:
-                print('the capacity is overwhelmed')
-                self.Problems.append('the capacity is overwhelmed')
-        if number_of_customers != self.number_of_customer_with_needs:
-            print('the number of routed customers does not match with the number of customer')
-            self.Problems.append('the number of routed customers does not match with the number of customer')
-        for customer in [i for i in range(1, self.number_of_customer + 1) if
-                                           sum(self.customer_demands[i]) > 0]:
-            sumation = 0
-            for route in self.Routes:
-                if customer in route:
-                    sumation+=1
-            if sumation!=1:
-                print('there is a problem with customer %f'%customer)
-                self.Problems.append('there is a problem with customer %f'%customer)
+            self.Capacity_related_to_Routes[-1][0][product] += (
+                self.customer_demands[customer][product]
+            )
 
-    def change_last_by_0(self)->None:
-        """to make it easier to understand, the last index of each route is replaced by 0"""
-        for r in range(len(self.Routes)):
-            self.Routes[r][-1]=self.Routes[r][-1]%(self.number_of_customer+1)
+        added_distance = (
+            self.Distance_between_customers[prev_node][customer]
+            + self.Distance_between_customers[next_node][customer]
+            - self.Distance_between_customers[prev_node][next_node]
+        )
+        self.Capacity_related_to_Routes[-1][1] += added_distance
 
-    def heuristic(self):
+    # ================================================================
+    # Feasibility check for insertion positions
+    # ================================================================
+
+    def update_Feasible_insertion_places(
+        self, customer: CustomerID, route: List[int]
+    ) -> None:
+        """Populate ``Feasible_insertion_places`` with all valid positions for *customer* in *route*.
+
+        An insertion between ``route[k]`` and ``route[k+1]`` is feasible when:
+
+        1. The vehicle can reach *customer* before its latest service time.
+        2. Adding *customer* keeps all product loads within capacity.
+        3. Inserting *customer* does not push any subsequent node past its
+           latest service time.
+        4. The total route distance remains within ``length_capacity``.
+
+        Args:
+            customer: Candidate customer to insert (not yet in the route).
+            route: Current (partial) route list including depot sentinels.
         """
-        Methodology :
-        Step 0 : Initialization
-        Step 1 : Select a ‘seed’ customer to start a router.
-        Step 2 : Find the feasible non-routed customer u that minimizes the composite criterion Impact(u):
-            Step2 a : Examine all possible feasible insertions i of customer u into the current route under construction
-            Step 2b : Calculate local disturbances LDu (extra distance, marginal time feasibility and time window compatibility)
-            Step 2c : Calculate global disturbance IRu of customer u
-            Step 2d : Calculate the coverage customer u time window ISu
-            Step 2e : Calculate the real coverage of time windows of the non-routed customers result- ing from the insertion of u into the current route IUu
-            Step 2f : Calculate the total waiting time of route IWu
-            Step 2g : Calculate Impact(u)
-            Step 2h : Select insertion location i that results in minimum LDu for customer u
-            Step 2i : Select customer u with minimum Impact(u)
-        Step 3 : Insert the selected customer u to the insertion location with minimum local disturbance LDu of the current route r. Update the route and set u as a routed customer and remove u from set J
-        Step 4 : If there are non-routed customers that are feasible for insertion in to the current router,return to Step1; otherwise proceed to Step5
-        Step 5 : If all customers have been scheduled, go to Step6. Otherwise, go to Step 1 - initiate new route
-        Step 6 : Terminate Output number of routes (active vehicles), sequence of customers visited by each vehicle, total distance (time) travelled and total cost.
+        self.Feasible_insertion_places = []
+        depot_modulo = self.number_of_customer + 1
+        max_distance = self.Vehicle_parameters["length_capacity"]
+
+        for idx in range(len(route) - 1):
+            # ---- time feasibility at the insertion position ----------------
+            arrival_at_customer = self._arrival_time_after(route[idx], customer)
+            if arrival_at_customer > self.Latest_service_time[customer]:
+                continue
+
+            # ---- product capacity ----------------------------------------
+            if not self._check_product_capacity(customer, route):
+                continue
+
+            # ---- route distance constraint --------------------------------
+            next_node = route[idx + 1] % depot_modulo
+            detour = (
+                self.Distance_between_customers[route[idx]][customer]
+                + self.Distance_between_customers[next_node][customer]
+                - self.Distance_between_customers[route[idx]][next_node]
+            )
+            if self.Capacity_related_to_Routes[-1][1] + detour > max_distance:
+                continue
+
+            # ---- time propagation for subsequent stops --------------------
+            # Compute the time delay delta caused by inserting the customer,
+            # then verify that no downstream node would miss its deadline.
+            prev_node = route[idx]
+            arrival_at_prev = self.Arrival_time[prev_node]
+
+            arrival_at_customer_via_prev = max(
+                self.Earliest_service_time[customer],
+                arrival_at_prev
+                + self.Service_time[prev_node]
+                + self.Distance_between_customers[customer][prev_node]
+                / self.Vehicle_parameters["speed"],
+            )
+            arrival_at_next_via_customer = max(
+                self.Earliest_service_time[next_node],
+                arrival_at_customer_via_prev
+                + self.Service_time[customer]
+                + self.Distance_between_customers[customer][next_node]
+                / self.Vehicle_parameters["speed"],
+            )
+            arrival_at_next_direct = max(
+                self.Earliest_service_time[next_node],
+                arrival_at_prev
+                + self.Service_time[prev_node]
+                + self.Distance_between_customers[prev_node][next_node]
+                / self.Vehicle_parameters["speed"],
+            )
+            time_delay = arrival_at_next_via_customer - arrival_at_next_direct
+
+            all_downstream_feasible = all(
+                time_delay
+                <= self.Latest_service_time[route[k]] - self.Arrival_time[route[k]]
+                for k in range(idx + 1, len(route) - 1)
+            )
+            if all_downstream_feasible:
+                self.Feasible_insertion_places.append(idx)
+
+    # ================================================================
+    # Metric functions  (local disturbance of a single insertion)
+    # ================================================================
+
+    def metric1_distance_increase(
+        self,
+        customer: CustomerID,
+        predecessor: CustomerID,
+        successor: CustomerID,
+    ) -> float:
+        """Extra distance incurred by inserting *customer* between *predecessor* and *successor*.
+
+        Implements the Clark & Wright savings-based distance criterion c₁.
+
+        Args:
+            customer: Customer to insert.
+            predecessor: Node immediately before the insertion point.
+            successor: Node immediately after the insertion point.
+
+        Returns:
+            ``D[predecessor][customer] + D[customer][successor] - D[predecessor][successor]``
         """
-        # step0 : creating of a 'seed' customer set in which all customer are far from the depot because they are the most difficult to insert in a route
+        return (
+            self.Distance_between_customers[predecessor][customer]
+            + self.Distance_between_customers[customer][successor]
+            - self.Distance_between_customers[predecessor][successor]
+        )
+
+    def metric2_time_delay(
+        self,
+        customer: CustomerID,
+        predecessor: CustomerID,
+        successor: CustomerID,
+    ) -> float:
+        """Marginal time delay imposed on *successor* by inserting *customer*.
+
+        Implements criterion c₂ — the additional time the successor must wait
+        compared to direct service.
+
+        Args:
+            customer: Customer to insert.
+            predecessor: Node immediately before the insertion point.
+            successor: Node immediately after the insertion point.
+
+        Returns:
+            Marginal time delay at *successor* (may be negative when the
+            insertion reduces waiting).
+        """
+        return (
+            self._arrival_time_after(predecessor, customer)
+            + self.Service_time[customer]
+            + (
+                self.Distance_between_customers[customer][successor]
+                - self.Distance_between_customers[predecessor][successor]
+            )
+            / self.Vehicle_parameters["speed"]
+            - self.Arrival_time[predecessor]
+            - self.Service_time[predecessor]
+        )
+
+    def metric3_time_gap(
+        self,
+        customer: CustomerID,
+        predecessor: CustomerID,
+        successor: CustomerID,
+    ) -> float:
+        """Time slack remaining at *customer*'s deadline after insertion.
+
+        Implements criterion c₃ — a positive value indicates comfortable
+        time-window compatibility; a negative value means infeasibility.
+
+        Args:
+            customer: Customer to insert.
+            predecessor: Node immediately before the insertion point.
+            successor: Unused — kept for a uniform signature with the other
+                metric functions.
+
+        Returns:
+            ``L[customer] - (A[predecessor] + S[predecessor] + D[predecessor][customer] / speed)``
+        """
+        travel = (
+            self.Distance_between_customers[predecessor][customer]
+            / self.Vehicle_parameters["speed"]
+        )
+        return (
+            self.Latest_service_time[customer]
+            - (self.Arrival_time[predecessor] + self.Service_time[predecessor] + travel)
+        )
+
+    # ================================================================
+    # Impact functions  (global insertion score across all candidates)
+    # ================================================================
+
+    def Impact1_time_window_coverage(
+        self, customer: CustomerID, predecessor: CustomerID
+    ) -> float:
+        """Penalise early arrivals at *customer* (time-window coverage criterion).
+
+        A small value means the vehicle arrives close to the customer's
+        earliest allowed service time, which is preferred.
+
+        Args:
+            customer: Candidate customer.
+            predecessor: The node that immediately precedes the insertion point.
+
+        Returns:
+            ``A[predecessor] + S[predecessor] + D[customer][predecessor] / speed - E[customer]``
+        """
+        travel = (
+            self.Distance_between_customers[customer][predecessor]
+            / self.Vehicle_parameters["speed"]
+        )
+        return (
+            self.Arrival_time[predecessor]
+            + self.Service_time[predecessor]
+            + travel
+            - self.Earliest_service_time[customer]
+        )
+
+    def Impact2_total_waiting_time(
+        self, customer: CustomerID, route: List[int]
+    ) -> float:
+        """Sum of waiting times across all currently-assigned stops in *route*.
+
+        A vehicle waits at stop *i* when it arrives before ``E[i]``.  The
+        total waiting time is a proxy for schedule slack.
+
+        Args:
+            customer: Candidate customer (used for context only; waiting time
+                is computed over the existing route stops).
+            route: Current route under construction.
+
+        Returns:
+            ``∑ max(0, E[i] - A[i])`` for all stops *i* in *route*.
+        """
+        return sum(
+            max(0.0, self.Earliest_service_time[i] - self.Arrival_time[i])
+            for i in route
+        )
+
+    def Impact3_non_routed_customers(self, customer: CustomerID) -> float:
+        """Measure how inserting *customer* reduces the reachability of other unrouted customers.
+
+        Encourages clustering by favouring insertions that keep the remaining
+        unrouted customers reachable.
+
+        Args:
+            customer: Candidate customer being evaluated.
+
+        Returns:
+            Average over all other unrouted customers *j* of
+            ``max(L[j] - E[customer] - D[customer][j] / speed,
+                  L[customer] - E[j] - D[customer][j] / speed)``.
+            Returns 0.0 when *customer* is the last unrouted customer.
+        """
+        remaining = self.J_non_routed_customers_set
+        if len(remaining) <= 1:
+            return 0.0
+
+        total = sum(
+            max(
+                self.Latest_service_time[j]
+                - self.Earliest_service_time[customer]
+                - self.Distance_between_customers[customer][j]
+                / self.Vehicle_parameters["speed"],
+                self.Latest_service_time[customer]
+                - self.Earliest_service_time[j]
+                - self.Distance_between_customers[customer][j]
+                / self.Vehicle_parameters["speed"],
+            )
+            for j in remaining
+            if j != customer
+        )
+        return total / (len(remaining) - 1)
+
+    def Impact4_metrics_summation(
+        self,
+        customer: CustomerID,
+        predecessor: CustomerID,
+        successor: CustomerID,
+    ) -> float:
+        """Weighted sum of the three local disturbance metrics for one insertion position.
+
+        Args:
+            customer: Candidate customer.
+            predecessor: Node before the insertion point.
+            successor: Node after the insertion point.
+
+        Returns:
+            ``w₁·c₁ + w₂·c₂ + w₃·c₃`` where ``wₖ`` are the metric
+            hyperparameters (each 1/3 by default).
+        """
+        return (
+            self.hyperparameter_metric1 * self.metric1_distance_increase(customer, predecessor, successor)
+            + self.hyperparameter_metric2 * self.metric2_time_delay(customer, predecessor, successor)
+            + self.hyperparameter_metric3 * self.metric3_time_gap(customer, predecessor, successor)
+        )
+
+    # ================================================================
+    # Utility methods
+    # ================================================================
+
+    def get_number_of_customer_in_Routes(self) -> int:
+        """Return the total number of customers currently assigned to routes."""
+        return sum(len(route) - 2 for route in self.Routes)
+
+    def compute_done_distance(self) -> None:
+        """Compute and store total distance and per-vehicle distances.
+
+        Populates ``Distance_done[0]`` (total) and ``Distance_done[1]``
+        (list of per-vehicle distances).
+        """
+        depot_modulo = self.number_of_customer + 1
+        self.Distance_done[1] = [
+            sum(
+                self.Distance_between_customers[route[i]][
+                    route[i + 1] % depot_modulo
+                ]
+                for i in range(len(route) - 1)
+            )
+            for route in self.Routes
+        ]
+        self.Distance_done[0] = sum(self.Distance_done[1])
+
+    def change_last_by_0(self) -> None:
+        """Normalise the last element of every route to 0 (depot index).
+
+        During construction the depot return is encoded as
+        ``number_of_customer + 1`` to distinguish it from the depot departure.
+        This method replaces that sentinel with 0 for a cleaner output.
+        """
+        depot_modulo = self.number_of_customer + 1
+        for route in self.Routes:
+            route[-1] = route[-1] % depot_modulo
+
+    # ================================================================
+    # Core heuristic
+    # ================================================================
+
+    def heuristic(self) -> List[List[int]]:
+        """Execute the ALNS-inspired greedy insertion heuristic.
+
+        Constructs a solution by iteratively opening routes, selecting seed
+        customers, and inserting the unrouted customer with the lowest Impact
+        score at its least-disturbing feasible position.
+
+        The six-step algorithm is described in the class docstring.
+
+        Returns:
+            The constructed set of routes (same object as ``self.Routes``).
+        """
+        # Step 0 — compute polar coordinates for all customers (used for
+        #           seed selection).
         self.furthest_from_the_depot()
-        # compute self.customers_polar_coordinates_set
-        return_to_step1_with_new_route = 1
-        index_for_seed_customer_choice = 0
-        seed_customer = [[0,0],0]
-        while self.J_non_routed_customers_set != []:  # while not all customers are served :
-            ### step 1 : Select a‘seed’customer to start a router
-            if return_to_step1_with_new_route == 1:
+
+        needs_new_route = True
+        seed_customer = [[0.0, 0.0], 0]
+
+        while self.J_non_routed_customers_set:
+            # ---- Step 1: open a new route with a seed customer -----------
+            if needs_new_route:
                 self.current_angle_for_route += seed_customer[0][1]
-                # as there is a new route (or not for the begining but it doesn't matter where we start), the currant_angle_for_new_route has to be set as the previous "seed" customer angle
-                if self.current_angle_for_route > np.pi:
-                    self.current_angle_for_route -= 2 * np.pi
-                # we have to check if the current angle is in (-pi,pi]
+                if self.current_angle_for_route > math.pi:
+                    self.current_angle_for_route -= 2 * math.pi
+
                 seed_customer = self.next_seed_customer()
-                # the seed_customer will create the new route because it is one of the furthest one from the depot and it is always difficult at the end to integer them in the route
-                # we choose the customer which has the largest radius and an angle between self.current_angle_for_route and self.current_angle_for_route+self.angle_rotation_for_new_route
+
+                # Skip seeds that have already been assigned to a route.
                 while seed_customer[1] not in self.J_non_routed_customers_set:
-                    # we have to check if the customer picked in the 'seed' customer set is not already assigned to a route
-                    self.Customers_polar_coordinates_set = [element for element in self.Customers_polar_coordinates_set
-                                                            if element[1] != seed_customer[1]]
-                    # we remove the current seed_customer as it is not J_non_routed_customer_set
+                    self.Customers_polar_coordinates_set = [
+                        c for c in self.Customers_polar_coordinates_set
+                        if c[1] != seed_customer[1]
+                    ]
                     seed_customer = self.next_seed_customer()
-                route = [0, seed_customer[1], self.number_of_customer + 1]
-                # self.number_of_customer+1 | self.number_of_customer + 1 = 0
+
+                seed_id: CustomerID = seed_customer[1]
+                route = [0, seed_id, self.number_of_customer + 1]
+                initial_capacity = [
+                    self.customer_demands[seed_id][p]
+                    for p in range(self.number_of_products)
+                ]
                 self.Capacity_related_to_Routes.append(
-                    [[self.customer_demands[seed_customer[1]][product] for product in range(self.number_of_products)],
-                     2 * self.Distance_between_customers[0][seed_customer[1]]])
-                self.J_non_routed_customers_set.remove(seed_customer[1])
-                # the picked 'seed' customer is not anymore non-routed
-                self.Arrival_time[seed_customer[1]] = max(self.Earliest_service_time[seed_customer[1]],
-                                                          self.Arrival_time[0]+self.Distance_between_customers[0][route[1]]/self.Vehicle_parameters['speed'])
-                # for this 'seed' customer, the best is when there it starts at its lower bound of service time to let as much as possible time for other customers
-                if self.Arrival_time[seed_customer[1]] > self.Latest_service_time[seed_customer[1]]:
-                    print('the vehicle is too slow to deliver customer %f'% int(seed_customer[1]))
-                if 2*self.Distance_between_customers[0][seed_customer[1]]>self.Vehicle_parameters['lenght_capacity']:
-                    print('the distance capacity of the vehicle does not allow to reach the customer %f'% int(seed_customer[1]))
-                # we have to check if it feasible to reach the "seed" customer regarding the time windows. If not, either the speed is too low or the customer is too far
-            Impact_table = []
-            # creation of an Impact table to save all value in order to be able to choose the minimal one
-            if not (self.J_non_routed_customers_set):
-                ### step 6
+                    [initial_capacity, 2 * self.Distance_between_customers[0][seed_id]]
+                )
+                self.J_non_routed_customers_set.remove(seed_id)
+
+                self.Arrival_time[seed_id] = max(
+                    self.Earliest_service_time[seed_id],
+                    self.Arrival_time[0]
+                    + self.Distance_between_customers[0][seed_id]
+                    / self.Vehicle_parameters["speed"],
+                )
+                if self.Arrival_time[seed_id] > self.Latest_service_time[seed_id]:
+                    warnings.warn(
+                        f"Vehicle is too slow to reach customer {seed_id} "
+                        f"within its time window.",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+
+            # ---- Step 6: all customers served ---------------------------
+            if not self.J_non_routed_customers_set:
                 self.Routes.append(route)
                 self.update_Arrival_time_with_same_order_than_Routes()
                 self.number_of_vehicle = len(self.Routes)
                 return self.Routes
-            ### Step2:Find the feasible non-routed customer u that minimizes the composite criterion Impact(u):
+
+            # ---- Step 2: compute Impact score for each candidate --------
+            impact_scores: List[Tuple[float, int, CustomerID]] = []
+
+            for candidate in self.J_non_routed_customers_set:
+                self.update_Feasible_insertion_places(candidate, route)
+
+                if not self.Feasible_insertion_places:
+                    impact_scores.append((_INFEASIBLE_IMPACT, 0, candidate))
+                    continue
+
+                # Step 2b: local disturbances at each feasible position.
+                local_disturbances = [
+                    self.Impact4_metrics_summation(
+                        candidate,
+                        route[pos],
+                        route[pos + 1] % (self.number_of_customer + 1),
+                    )
+                    for pos in self.Feasible_insertion_places
+                ]
+
+                # Step 2c: best insertion position minimises local disturbance.
+                best_local_idx = local_disturbances.index(min(local_disturbances))
+                best_insertion_pos = self.Feasible_insertion_places[best_local_idx]
+
+                avg_local_disturbance = sum(local_disturbances) / len(local_disturbances)
+
+                # Step 2g: composite Impact score.
+                score = (
+                    self.hyperparameter_impact1
+                    * self.Impact1_time_window_coverage(candidate, route[best_insertion_pos])
+                    + self.hyperparameter_impact2
+                    * self.Impact2_total_waiting_time(candidate, route)
+                    + self.hyperparameter_impact3
+                    * self.Impact3_non_routed_customers(candidate)
+                    + self.hyperparameter_impact4 * avg_local_disturbance
+                )
+                impact_scores.append((score, best_insertion_pos, candidate))
+
+            # ---- Step 3: insert the best candidate ----------------------
+            best_score, best_pos, best_customer = min(impact_scores)
+
+            if best_score == _INFEASIBLE_IMPACT:
+                # No candidate can be inserted — close the route.
+                self.Routes.append(route)
+                needs_new_route = True
+                continue
+
+            self.J_non_routed_customers_set.remove(best_customer)
+            self.update_Capacity_related_to_Routes(best_pos, best_customer, route)
+            route.insert(best_pos + 1, best_customer)
+            self.update_arrival_time(best_pos, route)
+
+            # ---- Step 6 (early): if this was the last customer, terminate.
+            if not self.J_non_routed_customers_set:
+                self.Routes.append(route)
+                self.update_Arrival_time_with_same_order_than_Routes()
+                self.number_of_vehicle = len(self.Routes)
+                return self.Routes
+
+            # ---- Step 4: check whether another insertion is still possible.
+            # update_Feasible_insertion_places mutates self.Feasible_insertion_places;
+            # we call it for each remaining customer and stop as soon as one is feasible.
+            any_feasible = False
             for u in self.J_non_routed_customers_set:
                 self.update_Feasible_insertion_places(u, route)
-                ## Step 2a : Examine all possible feasible insertions i of customer u into the current route under construction
-                if not (self.Feasible_insertion_places):
-                    Impact_table.append((10 ** 5, 0, u))
-                else:
-                    Impact4__metrics_summation__table = []
-                    # table for local disturbances
-                    for insertion_place in self.Feasible_insertion_places:
-                        ## Step 2b : Calculate local disturbances LDu for each position
-                        Impact4__metrics_summation__table.append(
-                            self.Impact4_metrics_summation(u, route[insertion_place],
-                                                           route[insertion_place + 1] % (self.number_of_customer + 1)))
-                        # saving of the value in this table
-                    Impact4_already_assigned_customers = sum(Impact4__metrics_summation__table) / len(
-                        self.Feasible_insertion_places)
-                    # computation of the global disturbances
-                    insertion_index = self.Feasible_insertion_places[
-                        Impact4__metrics_summation__table.index(min(Impact4__metrics_summation__table))]
-                    # looking for the insertion index of the minimum value related to the global disturbance
-                    Impact_table.append((self.hyperparameter_impact1 * self.Impact1_time_window_coverage(u, route[
-                        insertion_index]) + self.hyperparameter_impact3 * self.Impact3_non_routed_customers(
-                        u) + self.hyperparameter_impact2 * self.Impact2_total_waiting_time(u,
-                                                                                           route) + self.hyperparameter_impact4 * Impact4_already_assigned_customers,
-                                         insertion_index, u))
-                    # computation of the Impact with at the end the index of insertion and u
-            if min(Impact_table)[0] != 10 ** 5:
-                u_best_customer = Impact_table[Impact_table.index(min(Impact_table))][2]
-                i_best_index = Impact_table[Impact_table.index(min(Impact_table))][1]  # insertion between i and i+1 element
-                ### step 3 : Insert the selected customer u to the insertion location with minimum local disturbance LDu of the current route r. Update the route and set u as a routed customer and remove u from set J
-                self.J_non_routed_customers_set.remove(u_best_customer)
-                self.update_Capacity_related_to_Routes(i_best_index, u_best_customer, route)
-                route.insert(i_best_index + 1, u_best_customer)
-                # self.display_current_solution(route)
-                self.update_arrival_time(i_best_index, route)
-                # step 4 : test if there are non-routed customers that are feasible for insertion into the current router
-                compt = 0
-                for u in self.J_non_routed_customers_set:
-                    self.update_Feasible_insertion_places(u, route)
-                    if self.Feasible_insertion_places != []:
-                        break
-                    else:
-                        compt += 1
-                if compt == len(self.J_non_routed_customers_set):
-                    # it means that there is now feasible insertion for route "route"
-                    self.Routes.append(route)
-                    # route is closed
-                    if not (self.J_non_routed_customers_set):
-                        ### step 6 beacuse there is now more non-routed customers
-                        self.update_Arrival_time_with_same_order_than_Routes()
-                        self.number_of_vehicle = len(self.Routes)
-                        return self.Routes
-                    else:
-                        # back to step 1 with new route
-                        return_to_step1_with_new_route = 1
-                        # needed for picking the next 'seed' customer
-                else:
-                    # back to step 1 without new route
-                    return_to_step1_with_new_route = 0
-            else:
-                # back to step 1 with new route
+                if self.Feasible_insertion_places:
+                    any_feasible = True
+                    break
+
+            if not any_feasible:
+                # No more insertions possible in this route — close it (Step 5 → Step 1).
                 self.Routes.append(route)
-                return_to_step1_with_new_route = 1
-                # needed for picking the next 'seed' customer
+                needs_new_route = True
+            else:
+                needs_new_route = False
+
         self.update_Arrival_time_with_same_order_than_Routes()
         self.number_of_vehicle = len(self.Routes)
-        # while loop is over, it means it is the end
+        return self.Routes
 
+    # ================================================================
+    # Solution validation
+    # ================================================================
 
+    def _check_all_is_allright(self) -> None:
+        """Internal implementation of constraint checking (see :meth:`check_solution`)."""
+        routed_count = 0
+        depot_modulo = self.number_of_customer + 1
 
-    def all_run(self):
-        self.heuristic()
-        self.compute_done_distance()
-        self.change_last_by_0()
-        print('Number of Vehicles:',self.number_of_vehicle)
-        print('Routes:',self.Routes)
-        print('Delivery time for each customers in the same order than the route:',self.Arrival_time_with_same_order_than_Routes)
-        print('Products Capacity needed by each vehicle:',[self.Capacity_related_to_Routes[i][0] for i in range(self.number_of_vehicle)])
-        print('Traveled Distance by each vehicle:',[self.Capacity_related_to_Routes[i][1] for i in range(self.number_of_vehicle)])
-        print('Traveled Distance:',self.Distance_done[0])
+        for route in self.Routes:
+            routed_count += len(route) - 2
 
+            # Distance constraint
+            route_distance = sum(
+                self.Distance_between_customers[route[i]][route[i + 1] % depot_modulo]
+                for i in range(len(route) - 1)
+            )
+            if route_distance > self.Vehicle_parameters["length_capacity"]:
+                msg = (
+                    f"Route {self.Routes.index(route)}: distance {route_distance:.2f} "
+                    f"exceeds length_capacity {self.Vehicle_parameters['length_capacity']}."
+                )
+                self.Problems.append(msg)
 
+            # Monotone arrival times
+            delays = [
+                self.Arrival_time[route[i]] - self.Arrival_time[route[i + 1]]
+                for i in range(len(route) - 2)
+            ]
+            if max(delays) > 0:
+                self.Problems.append(
+                    f"Route {self.Routes.index(route)}: arrival times are not monotone."
+                )
 
-# n = 10
-# p = 3
-# Coordinates = {i: (rnd.randint(-10, 10), rnd.randint(-10, 10)) for i in range(n + 1)}
-# Customer_demands = {i: [int(rnd.random()+0.75) * rnd.randint(0, 10) for product in range(p)] for i in range(1, n + 1)}
-# Customer_demands[0] = 0
-# Vehicle_parameters = {'lenght_capacity': 100, 'speed': 100,
-#                       'product_capacity': {product: 50 for product in range(p)}}
-# Earliest_service_time = [5] + [6 + rnd.randint(0, 10) for i in range(n)] + [20]
-# Latest_service_time = [7] + [Earliest_service_time[i + 1] + rnd.randint(1, 4) for i in range(n)] + [22]
-# Service_time = {i: rnd.randint(0, 10) / 60 for i in range(1, n + 1)}
-# Service_time[0] = 0
-# VRP = MCVRPTW(Coordinates=Coordinates, Customer_demands=Customer_demands, Vehicle_parameters=Vehicle_parameters,
-#                Earliest_service_time=Earliest_service_time, Latest_service_time=Latest_service_time,
-#                Service_time=Service_time)
-# VRP.all_run()
-# VRP.display_solution()
-# print(VRP.Routes)
-# print(VRP.Arrival_time_with_same_order_than_Routes)
-# #
+            # Time-window constraints
+            route_capacity = [0.0] * self.number_of_products
+            for customer in route[1:-1]:
+                a_time = self.Arrival_time[customer]
+                if not (
+                    self.Earliest_service_time[customer]
+                    <= a_time
+                    <= self.Latest_service_time[customer]
+                ):
+                    self.Problems.append(
+                        f"Customer {customer}: arrival {a_time:.2f} outside "
+                        f"[{self.Earliest_service_time[customer]}, "
+                        f"{self.Latest_service_time[customer]}]."
+                    )
+                for product in range(self.number_of_products):
+                    route_capacity[product] += self.customer_demands[customer][product]
 
+            # Product capacity (per route)
+            for product in range(self.number_of_products):
+                limit = self.Vehicle_parameters["product_capacity"][product]
+                if route_capacity[product] > limit:
+                    self.Problems.append(
+                        f"Route {self.Routes.index(route)}: product {product} load "
+                        f"{route_capacity[product]:.2f} exceeds capacity {limit}."
+                    )
 
+        # All customers with demand must appear exactly once
+        if routed_count != self.number_of_customer_with_needs:
+            self.Problems.append(
+                f"Routed customers ({routed_count}) ≠ "
+                f"customers with demand ({self.number_of_customer_with_needs})."
+            )
+
+        for customer in self.J_non_routed_customers_set:
+            appearances = sum(customer in route for route in self.Routes)
+            if appearances != 1:
+                self.Problems.append(
+                    f"Customer {customer} appears {appearances} times across routes "
+                    f"(expected exactly 1)."
+                )
+
+    # ================================================================
+    # Input validation
+    # ================================================================
+
+    @staticmethod
+    def _validate_inputs(
+        coordinates: Dict,
+        customer_demands: Dict,
+        vehicle_parameters: Dict,
+        w1: float, w2: float, w3: float, w4: float,
+    ) -> None:
+        """Raise ``ValueError`` if any input invariant is violated."""
+        if not coordinates:
+            raise ValueError("'coordinates' must not be empty.")
+        if not customer_demands:
+            raise ValueError("'customer_demands' must not be empty.")
+        weight_sum = w1 + w2 + w3 + w4
+        if abs(weight_sum - 1.0) > 1e-6:
+            raise ValueError(
+                f"Impact hyperparameters must sum to 1.0, got {weight_sum:.6f}."
+            )
+        # Support both old (lenght_capacity) and new (length_capacity) key names
+        has_length = (
+            "length_capacity" in vehicle_parameters
+            or "lenght_capacity" in vehicle_parameters
+        )
+        if not has_length:
+            raise ValueError(
+                "'vehicle_parameters' must contain 'length_capacity'."
+            )
+        if "speed" not in vehicle_parameters:
+            raise ValueError("'vehicle_parameters' must contain 'speed'.")
+        if "product_capacity" not in vehicle_parameters:
+            raise ValueError("'vehicle_parameters' must contain 'product_capacity'.")
