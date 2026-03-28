@@ -144,6 +144,61 @@ print(f"Best total distance: {result['TD']:.2f}  Vehicles: {result['NV']}")
 
 ---
 
+## User Interfaces
+
+### 🌐 Web Interface (Recommended for beginners)
+
+An interactive Streamlit-based web application for running the heuristic without any command-line knowledge.
+
+**Features:**
+- Load benchmark datasets with one click
+- Upload custom CSV files
+- Adjust Impact weights interactively
+- Visualize routes on an interactive map
+- Export results as CSV/TXT
+
+**Getting started:**
+```bash
+chmod +x run_interface.sh    # macOS/Linux
+./run_interface.sh           # Opens at http://localhost:8501
+
+# Or Windows:
+run_interface.bat
+```
+
+**See:** [`README_INTERFACE.md`](README_INTERFACE.md) for detailed guide.
+
+### 💻 Command-Line Interface
+
+Fast, scriptable interface for batch processing and automation.
+
+**Examples:**
+```bash
+# List available datasets
+python3 cli.py --list-datasets
+
+# Run benchmark with visualization
+python3 cli.py --dataset C101.100 --visualize
+
+# Run custom problem and export results
+python3 cli.py --file my_problem.csv --export results.csv
+
+# Tune Impact weights
+python3 cli.py --dataset R101.200 --impact1 0.2 --impact4 0.5
+```
+
+**See:** [`cli.py --help`](cli.py) for all options.
+
+### 📖 Getting Started
+
+New users should start with [`GETTING_STARTED.md`](GETTING_STARTED.md) for:
+- 5-minute quick start guide
+- Installation instructions
+- Custom data format guide
+- Troubleshooting
+
+---
+
 ## API Reference
 
 ### `MCVRPTW`
